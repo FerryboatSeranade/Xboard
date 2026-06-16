@@ -5,10 +5,11 @@
 它适合当前这种机器形态：
 
 - 本地 Xboard 面板跑在 Docker 容器 `xboard-web-1`。
-- 远端服务器已经配置了 `ssh-skill` alias。
+- 远端服务器可以是已配置好的 `ssh-skill` alias，也可以只给 IP、用户名和密码。
 - VLESS Reality 默认监听 `443`。
 - 如果远端 `443` 被旧服务占用，可以显式传入停服命令。
 - 写入面板前会自动备份 SQLite 数据库。
+- 如果远端开启了 UFW/firewalld，默认会自动放行 `443/tcp`。
 
 所有远端命令都会通过 `ssh-skill` 执行，不直接调用裸 `ssh`。
 
@@ -24,16 +25,45 @@ chmod +x /root/data/docker_data/Xboard/ops/xboard-reality-machine.sh
 
 ```bash
 /root/data/docker_data/Xboard/ops/xboard-reality-machine.sh \
-  --ssh-alias dmit \
-  --machine-name dmit \
-  --node-name "dmit us" \
-  --host 69.63.203.46 \
-  --skip-install \
+  --ssh-alias vultr-002 \
+  --ssh-host 1.2.3.4 \
+  --ssh-user root \
+  --ssh-password '服务器密码' \
+  --machine-name vultr-002 \
+  --node-name vultr-002 \
   --yes \
   --dry-run
 ```
 
-## 新增或更新节点
+## 一条命令部署新机器
+
+给服务器连接信息后，脚本会自动完成：
+
+1. 创建或更新 `ssh-skill` alias。
+2. 用密码首次连接远端。
+3. 部署本机公钥，并把 alias 迁移成密钥免密。
+4. 创建或复用 Xboard machine。
+5. 创建或更新 VLESS Reality 节点。
+6. 安装或更新 `xboard-node`。
+7. 自动放行远端防火墙 `443/tcp`。
+8. 检查公网 `443`、远端健康检查和面板在线状态。
+
+```bash
+/root/data/docker_data/Xboard/ops/xboard-reality-machine.sh \
+  --ssh-alias vultr-002 \
+  --ssh-host 1.2.3.4 \
+  --ssh-user root \
+  --ssh-password '服务器密码' \
+  --machine-name vultr-002 \
+  --node-name vultr-002 \
+  --yes
+```
+
+这里如果不单独传 `--host`，节点对外地址会默认使用 `--ssh-host`。
+
+## 使用已有 ssh-skill alias 部署
+
+如果远端 alias 已经存在，可以只给 alias 和节点信息：
 
 ```bash
 /root/data/docker_data/Xboard/ops/xboard-reality-machine.sh \
@@ -44,14 +74,7 @@ chmod +x /root/data/docker_data/Xboard/ops/xboard-reality-machine.sh
   --yes
 ```
 
-脚本会做这些事：
-
-1. 备份 `/root/data/docker_data/Xboard/.docker/.data/database.sqlite`。
-2. 创建或复用 Xboard machine。
-3. 创建或更新 VLESS Reality 节点。
-4. 默认保留已有 Reality key；只有传 `--rotate-reality-keys` 才会轮换。
-5. 通过 machine 模式安装器安装或更新 `xboard-node`。
-6. 验证远端服务状态、健康检查、`443` 监听和面板节点在线状态。
+默认保留已有 Reality key；只有传 `--rotate-reality-keys` 才会轮换。
 
 ## 443 被旧服务占用时
 
@@ -81,6 +104,14 @@ chmod +x /root/data/docker_data/Xboard/ops/xboard-reality-machine.sh
   --yes
 ```
 
+## 常用开关
+
+- `--no-setup-ssh`：不自动创建或更新 `ssh-skill` alias。
+- `--no-migrate-key-auth`：不自动部署公钥，也不迁移密钥免密。
+- `--no-open-firewall`：不自动放行远端防火墙。
+- `--no-public-port-check`：不检查公网端口是否可连。
+- `--remote-stop-command`：目标端口被旧服务占用时，先执行这条远端命令释放端口。
+
 ## 备份位置
 
 每次真实执行都会创建一个备份目录：
@@ -93,10 +124,15 @@ chmod +x /root/data/docker_data/Xboard/ops/xboard-reality-machine.sh
 
 - `database.sqlite.before`
 - `database.sqlite.after`
+- `ssh-probe.json`
+- `ssh-deploy-pubkey.log`
+- `ssh-migrate-key-auth.log`
 - `panel-result.env`，包含 machine token 和 Reality 公开元信息
 - `remote-before.txt`
 - `remote-install.json` 或 `remote-restart.json`
+- `remote-firewall.json`
 - `remote-after.json`
+- `public-port-check.txt`
 - `panel-node-after.json`
 
 `panel-result.env` 和远端 JSON 文件权限会设为 `600`，因为里面可能有敏感信息。
