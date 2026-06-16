@@ -14,11 +14,6 @@ DEFAULT_REALITY_DEST_PORT="443"
 DEFAULT_FINGERPRINT="chrome"
 DEFAULT_FLOW="xtls-rprx-vision"
 DEFAULT_RATE="1"
-SSH_EXECUTE="${SSH_EXECUTE:-$HOME/.claude/skills/ssh-skill/scripts/ssh_execute.py}"
-SSH_SKILL_DIR="${SSH_SKILL_DIR:-$HOME/.claude/skills/ssh-skill/scripts}"
-SSH_CONFIG_MANAGER="${SSH_CONFIG_MANAGER:-$SSH_SKILL_DIR/ssh_config_manager_v3.py}"
-SSH_DEPLOY_PUBKEY="${SSH_DEPLOY_PUBKEY:-$SSH_SKILL_DIR/deploy_pubkey.py}"
-SSH_MIGRATE_KEY_AUTH="${SSH_MIGRATE_KEY_AUTH:-$SSH_SKILL_DIR/migrate_to_key_auth.py}"
 
 xboard_dir="$DEFAULT_XBOARD_DIR"
 container="$DEFAULT_CONTAINER"
@@ -47,12 +42,14 @@ show="true"
 enabled="true"
 skip_install="false"
 rotate_reality_keys="false"
-setup_ssh="auto"
 migrate_key_auth="true"
+auto_install_local_deps="true"
 open_firewall="true"
 verify_public_port="true"
 assume_yes="false"
 dry_run="false"
+remote_auth_mode="key"
+ssh_key_file_explicit="false"
 
 usage() {
   cat <<'EOF'
@@ -61,19 +58,19 @@ usage() {
 
 用途:
   为 Xboard 创建或更新 machine 模式的 VLESS Reality 节点，
-  通过 ssh-skill 在远端安装或重启 xboard-node，并验证 443 端口。
+  通过原生 OpenSSH 在远端安装或重启 xboard-node，并验证 443 端口。
 
 常用示例:
   ops/xboard-reality-machine.sh
-  ops/xboard-reality-machine.sh --ssh-alias dmit --machine-name dmit --node-name "dmit us" --host 69.63.203.46 --yes
-  ops/xboard-reality-machine.sh --ssh-alias vultr-002 --ssh-host 1.2.3.4 --ssh-password '密码' --yes
+  ops/xboard-reality-machine.sh --ssh-host 1.2.3.4 --ssh-user root --ssh-password '密码' --machine-name vultr-002 --node-name vultr-002 --yes
+  ops/xboard-reality-machine.sh --ssh-host dmit --machine-name dmit --node-name "dmit us" --host 69.63.203.46 --yes
 
 选项:
   --xboard-dir DIR             Xboard 目录。默认: /root/data/docker_data/Xboard
   --container NAME             Xboard PHP 容器名。默认: xboard-web-1
   --panel-url URL              面板 URL。留空时自动检测
-  --ssh-alias ALIAS            ssh-skill 里的远端机器别名
-  --ssh-host HOST              远端 SSH 主机名或 IP；提供后会自动创建/更新 ssh-skill alias
+  --ssh-alias ALIAS            本地标签；可作为 machine/node 默认名称，不依赖 ssh-skill
+  --ssh-host HOST              远端 SSH 主机名、IP 或 OpenSSH Host alias
   --ssh-user USER              远端 SSH 用户。默认: root
   --ssh-port PORT              远端 SSH 端口。默认: 22
   --ssh-password PASSWORD      远端 SSH 密码；用于首次连通和部署公钥
@@ -97,7 +94,7 @@ usage() {
                                示例: "cd /root/data/docker_data/glider2 && docker compose stop glider"
   --skip-install               不运行安装器，只重启/验证已有 xboard-node
   --rotate-reality-keys        更新已有节点时也轮换 Reality key
-  --no-setup-ssh               不自动创建/更新 ssh-skill alias
+  --no-install-local-deps       不自动安装本机 sshpass 等依赖
   --no-migrate-key-auth        不自动部署公钥/迁移密钥认证
   --no-open-firewall           不自动放行远端防火墙 443/tcp
   --no-public-port-check       不从本机检查节点公网端口
@@ -106,8 +103,7 @@ usage() {
   -h, --help                   显示帮助
 
 说明:
-  所有远端命令都会通过 ssh-skill 执行:
-    python3 ~/.claude/skills/ssh-skill/scripts/ssh_execute.py <alias> "<cmd>"
+  远端命令使用本机 ssh/sshpass 执行，不依赖 ssh-skill 或 Codex 环境。
 
   写入面板前会备份 SQLite 数据库:
     /root/data/docker_data/backups/xboard-reality-machine-<timestamp>/
@@ -203,7 +199,7 @@ parse_args() {
       --ssh-user) ssh_user="${2:?}"; shift 2 ;;
       --ssh-port) ssh_port="${2:?}"; shift 2 ;;
       --ssh-password) ssh_password="${2:?}"; shift 2 ;;
-      --ssh-key-file) ssh_key_file="${2:?}"; shift 2 ;;
+      --ssh-key-file) ssh_key_file="${2:?}"; ssh_key_file_explicit="true"; shift 2 ;;
       --machine-name) machine_name="${2:?}"; shift 2 ;;
       --node-name) node_name="${2:?}"; shift 2 ;;
       --host) host="${2:?}"; shift 2 ;;
@@ -222,7 +218,8 @@ parse_args() {
       --remote-stop-command) remote_stop_command="${2:?}"; shift 2 ;;
       --skip-install) skip_install="true"; shift ;;
       --rotate-reality-keys) rotate_reality_keys="true"; shift ;;
-      --no-setup-ssh) setup_ssh="false"; shift ;;
+      --no-install-local-deps) auto_install_local_deps="false"; shift ;;
+      --no-setup-ssh) auto_install_local_deps="false"; shift ;;
       --no-migrate-key-auth) migrate_key_auth="false"; shift ;;
       --no-open-firewall) open_firewall="false"; shift ;;
       --no-public-port-check) verify_public_port="false"; shift ;;
@@ -237,8 +234,6 @@ parse_args() {
 require_local_tools() {
   command -v docker >/dev/null || die "docker is required"
   command -v python3 >/dev/null || die "python3 is required"
-  [[ -f "$SSH_EXECUTE" ]] || die "ssh-skill executor not found: $SSH_EXECUTE"
-  [[ -f "$SSH_CONFIG_MANAGER" ]] || die "ssh-skill config manager not found: $SSH_CONFIG_MANAGER"
   docker ps --format '{{.Names}}' | grep -Fxq "$container" || die "container not running: $container"
   [[ -d "$xboard_dir" ]] || die "Xboard directory not found: $xboard_dir"
 }
@@ -258,11 +253,8 @@ detect_panel_url() {
 collect_inputs() {
   detect_panel_url
 
-  if [[ -z "$ssh_alias" ]]; then
-    prompt ssh_alias "ssh-skill alias"
-  fi
   if [[ -z "$ssh_host" ]]; then
-    prompt ssh_host "SSH host/IP (leave empty to reuse existing alias)" ""
+    prompt ssh_host "SSH host/IP or OpenSSH alias"
   fi
   if [[ -z "$ssh_host" && -n "$host" ]]; then
     ssh_host="$host"
@@ -272,6 +264,9 @@ collect_inputs() {
   fi
   if [[ -z "$host" ]]; then
     prompt host "Node host/IP shown to clients"
+  fi
+  if [[ -z "$ssh_alias" ]]; then
+    ssh_alias="$ssh_host"
   fi
   if [[ -z "$machine_name" ]]; then
     prompt machine_name "Xboard machine name" "$ssh_alias"
@@ -289,7 +284,7 @@ collect_inputs() {
   prompt reality_sni "Reality destination SNI" "$reality_sni"
   prompt reality_dest_port "Reality destination port" "$reality_dest_port"
 
-  [[ -n "$ssh_alias" ]] || die "--ssh-alias is required"
+  [[ -n "$ssh_host" ]] || die "--ssh-host is required"
   [[ -n "$host" ]] || die "--host is required"
   [[ "$ssh_port" =~ ^[0-9]+$ ]] || die "--ssh-port must be numeric"
   [[ -n "$machine_name" ]] || die "--machine-name is required"
@@ -308,8 +303,8 @@ Plan
   Xboard dir:        $xboard_dir
   Container:         $container
   Panel URL:         $panel_url
-  SSH alias:         $ssh_alias
-  SSH host/user:     ${ssh_host:-existing alias} / $ssh_user:$ssh_port
+  SSH label:         $ssh_alias
+  SSH target:        $ssh_user@$ssh_host:$ssh_port
   Machine:           $machine_name
   Node:              $node_name
   Host:              $host
@@ -323,7 +318,7 @@ Plan
   Show/enabled:      $show / $enabled
   Skip install:      $skip_install
   Rotate keys:       $rotate_reality_keys
-  Setup SSH:         $setup_ssh
+  Install deps:      $auto_install_local_deps
   Migrate key auth:  $migrate_key_auth
   Open firewall:     $open_firewall
   Public port check: $verify_public_port
@@ -564,280 +559,234 @@ backup_database_after() {
   fi
 }
 
-ssh_alias_exists() {
-  python3 "$SSH_CONFIG_MANAGER" find "$ssh_alias" \
-    | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("count",0) else 1)' >/dev/null
-}
+install_local_package() {
+  local package="$1"
 
-write_ssh_password_metadata() {
-  [[ -n "$ssh_password" ]] || return 0
-  local cfg="$HOME/.ssh/config"
+  [[ "$auto_install_local_deps" == "true" ]] || die "$package is required; install it or remove --no-install-local-deps"
+  [[ "$(id -u)" == "0" ]] || die "$package is required; run as root or install it manually"
 
-  python3 - "$cfg" "$ssh_alias" "$ssh_password" <<'PY'
-from pathlib import Path
-import sys
-
-cfg = Path(sys.argv[1]).expanduser()
-alias = sys.argv[2]
-password = sys.argv[3]
-
-lines = cfg.read_text(encoding="utf-8").splitlines(keepends=True)
-out = []
-in_alias_comments = False
-inserted = False
-
-for line in lines:
-    stripped = line.strip()
-    if stripped.startswith("# ===== "):
-        in_alias_comments = stripped == f"# ===== {alias} ====="
-        inserted = False
-        out.append(line)
-        continue
-
-    if in_alias_comments and stripped.startswith("# password:"):
-        continue
-
-    if stripped.startswith("Host ") and not stripped.startswith("Host *"):
-        host_alias = stripped.split(None, 1)[1].strip()
-        if host_alias == alias and not inserted:
-            out.append(f"# password: {password}\n")
-            inserted = True
-        out.append(line)
-        if host_alias != alias:
-            in_alias_comments = False
-        continue
-
-    out.append(line)
-
-cfg.write_text("".join(out), encoding="utf-8")
-cfg.chmod(0o600)
-PY
-}
-
-clean_ssh_secret_metadata() {
-  local cfg="$HOME/.ssh/config"
-  python3 - "$cfg" "$ssh_alias" <<'PY'
-from pathlib import Path
-import sys
-
-cfg = Path(sys.argv[1]).expanduser()
-alias = sys.argv[2]
-lines = cfg.read_text(encoding="utf-8").splitlines(keepends=True)
-out = []
-in_alias_comments = False
-
-for line in lines:
-    stripped = line.strip()
-    if stripped.startswith("# ===== "):
-        in_alias_comments = stripped == f"# ===== {alias} ====="
-        out.append(line)
-        continue
-    if in_alias_comments and stripped.startswith("# password:"):
-        continue
-    if in_alias_comments and stripped.startswith("# tags:"):
-        tags = []
-        for tag in stripped[len("# tags:"):].split(","):
-            tag = tag.strip()
-            if tag and not tag.startswith("pwd:"):
-                tags.append(tag)
-        out.append("# tags: " + ",".join(tags) + "\n")
-        continue
-    if stripped.startswith("Host ") and not stripped.startswith("Host *"):
-        host_alias = stripped.split(None, 1)[1].strip()
-        if host_alias != alias:
-            in_alias_comments = False
-    out.append(line)
-
-cfg.write_text("".join(out), encoding="utf-8")
-cfg.chmod(0o600)
-PY
-}
-
-setup_ssh_alias_if_needed() {
-  if [[ "$setup_ssh" == "false" ]]; then
-    return
+  info "Installing local dependency: $package"
+  if command -v apt-get >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y "$package"
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y "$package"
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y "$package"
+  elif command -v apk >/dev/null 2>&1; then
+    apk add --no-cache "$package"
+  elif command -v pacman >/dev/null 2>&1; then
+    pacman -Sy --noconfirm "$package"
+  else
+    die "cannot install $package automatically; install it manually"
   fi
+}
 
-  if [[ -z "$ssh_host" ]]; then
-    if ssh_alias_exists; then
-      info "Using existing ssh-skill alias: $ssh_alias"
-      return
+ensure_local_ssh_tools() {
+  command -v ssh >/dev/null || die "ssh is required"
+  command -v ssh-keygen >/dev/null || die "ssh-keygen is required"
+  command -v timeout >/dev/null || die "timeout is required"
+
+  if [[ -n "$ssh_password" ]] && ! command -v sshpass >/dev/null 2>&1; then
+    if is_true "$dry_run"; then
+      echo "DRY-RUN: would install sshpass for password SSH"
+    else
+      install_local_package sshpass
     fi
-    die "--ssh-host is required when ssh alias '$ssh_alias' does not exist"
   fi
-
-  info "Creating/updating ssh-skill alias"
-  if is_true "$dry_run"; then
-    echo "DRY-RUN: would create/update alias '$ssh_alias' -> $ssh_user@$ssh_host:$ssh_port"
-    return
-  fi
-
-  if ssh_alias_exists; then
-    python3 "$SSH_CONFIG_MANAGER" update "$ssh_alias" \
-      --host "$ssh_host" \
-      --user "$ssh_user" \
-      --port "$ssh_port" \
-      --environment production \
-      --description "Xboard Reality node" \
-      --tags xboard reality \
-      >/dev/null
-  else
-    python3 "$SSH_CONFIG_MANAGER" create \
-      --alias "$ssh_alias" \
-      --host "$ssh_host" \
-      --user "$ssh_user" \
-      --port "$ssh_port" \
-      --environment production \
-      --description "Xboard Reality node" \
-      --tags xboard reality \
-      >/dev/null
-  fi
-
-  write_ssh_password_metadata
-  python3 "$SSH_CONFIG_MANAGER" find "$ssh_alias" \
-    | python3 -c 'import json,sys; d=json.load(sys.stdin); print(json.dumps(d.get("results", []), ensure_ascii=False, indent=2))'
 }
 
-bootstrap_remote_ssh() {
-  setup_ssh_alias_if_needed
-
-  local probe_cmd
-  probe_cmd='set -e; echo "whoami=$(whoami)"; echo "hostname=$(hostname)"; echo "ssh_connection=$SSH_CONNECTION"; echo "local_ips=$(hostname -I)"; echo "public_v4=$(curl -4 -fsS --max-time 8 https://api.ipify.org || true)"; echo "machine_id=$(cat /etc/machine-id 2>/dev/null || true)"'
-
-  info "Verifying SSH connection"
-  if is_true "$dry_run"; then
-    echo "DRY-RUN remote[$ssh_alias]: $probe_cmd"
-  else
-    remote_run "SSH probe" "$probe_cmd" "$backup_dir/ssh-probe.json" "$remote_timeout"
-  fi
-
-  if [[ "$migrate_key_auth" == "false" ]]; then
-    return
-  fi
-
-  local expanded_key pubkey_file key_name
+ensure_local_ssh_key() {
+  local expanded_key
   expanded_key="$(expand_path "$ssh_key_file")"
-  pubkey_file="${expanded_key}.pub"
-  key_name="$(basename "$expanded_key")"
-  [[ -f "$pubkey_file" ]] || die "public key not found: $pubkey_file"
 
-  info "Deploying public key and migrating SSH alias to key auth"
+  if [[ -f "$expanded_key" && -f "${expanded_key}.pub" ]]; then
+    return
+  fi
+
   if is_true "$dry_run"; then
-    echo "DRY-RUN: would deploy $pubkey_file and migrate alias '$ssh_alias' to $expanded_key"
+    echo "DRY-RUN: would generate SSH key $expanded_key"
     return
   fi
 
-  if python3 "$SSH_CONFIG_MANAGER" list-servers \
-      | python3 -c 'import json,sys; d=json.load(sys.stdin); alias=sys.argv[1]; item=next((s for s in d.get("servers", []) if s.get("alias")==alias), {}); sys.exit(0 if item.get("auth")=="密钥" else 1)' "$ssh_alias"; then
-    info "SSH alias already uses key auth"
-    clean_ssh_secret_metadata
-    return
-  fi
-
-  [[ -n "$ssh_password" ]] || die "--ssh-password is required to deploy public key for first-time key auth"
-  python3 "$SSH_DEPLOY_PUBKEY" "$ssh_alias" --pubkey-file "$pubkey_file" --key-name "$key_name" | tee "$backup_dir/ssh-deploy-pubkey.log"
-  python3 "$SSH_MIGRATE_KEY_AUTH" "$ssh_alias" --key-file "$key_name" | tee "$backup_dir/ssh-migrate-key-auth.log"
-  clean_ssh_secret_metadata
-  remote_run "Verifying key-auth SSH" "$probe_cmd" "$backup_dir/ssh-key-probe.json" "$remote_timeout"
+  mkdir -p "$(dirname "$expanded_key")"
+  chmod 700 "$(dirname "$expanded_key")" || true
+  info "Generating local SSH key: $expanded_key"
+  ssh-keygen -t ed25519 -f "$expanded_key" -N "" -C "xboard-reality-machine@$(hostname 2>/dev/null || echo local)"
 }
 
-remote_json() {
+remote_target() {
+  printf "%s@%s" "$ssh_user" "$ssh_host"
+}
+
+remote_exec() {
+  local timeout_seconds="$1"
+  local remote_cmd="$2"
+  local target
+  local expanded_key
+  local -a ssh_args
+
+  target="$(remote_target)"
+  expanded_key="$(expand_path "$ssh_key_file")"
+  ssh_args=(
+    -p "$ssh_port"
+    -o "StrictHostKeyChecking=accept-new"
+    -o "ConnectTimeout=15"
+    -o "ServerAliveInterval=30"
+    -o "ServerAliveCountMax=3"
+  )
+
+  if [[ "$remote_auth_mode" == "password" ]]; then
+    [[ -n "$ssh_password" ]] || die "--ssh-password is required for password auth"
+    command -v sshpass >/dev/null || die "sshpass is required for password auth"
+    SSHPASS="$ssh_password" timeout "$timeout_seconds" sshpass -e ssh \
+      "${ssh_args[@]}" \
+      -o "PreferredAuthentications=password" \
+      -o "PubkeyAuthentication=no" \
+      "$target" "$remote_cmd"
+  else
+    if [[ "$ssh_key_file_explicit" == "true" && ! -f "$expanded_key" ]]; then
+      die "SSH key file not found: $expanded_key"
+    fi
+    if [[ -f "$expanded_key" && ( "$ssh_key_file_explicit" == "true" || -n "$ssh_password" ) ]]; then
+      ssh_args+=(-i "$expanded_key")
+    fi
+    timeout "$timeout_seconds" ssh "${ssh_args[@]}" "$target" "$remote_cmd"
+  fi
+}
+
+write_remote_result_json() {
+  local exit_code="$1"
+  local stdout_file="$2"
+  local stderr_file="$3"
+  local result_file="$4"
+
+  python3 - "$exit_code" "$stdout_file" "$stderr_file" <<'PY' > "$result_file"
+import json
+import sys
+from pathlib import Path
+
+exit_code = int(sys.argv[1])
+stdout = Path(sys.argv[2]).read_text(errors="replace")
+stderr = Path(sys.argv[3]).read_text(errors="replace")
+print(json.dumps({
+    "success": exit_code == 0,
+    "exit_code": exit_code,
+    "stdout": stdout,
+    "stderr": stderr,
+}, ensure_ascii=False, indent=2))
+PY
+  chmod 600 "$result_file" || true
+}
+
+remote_run_capture() {
   local remote_cmd="$1"
-  local timeout="${2:-$remote_timeout}"
-  python3 "$SSH_EXECUTE" "$ssh_alias" "$remote_cmd" --timeout "$timeout"
+  local result_file="${2:-}"
+  local timeout_seconds="${3:-$remote_timeout}"
+  local stdout_file stderr_file status
+
+  stdout_file="$(mktemp)"
+  stderr_file="$(mktemp)"
+  set +e
+  remote_exec "$timeout_seconds" "$remote_cmd" >"$stdout_file" 2>"$stderr_file"
+  status=$?
+  set -e
+
+  cat "$stdout_file"
+  cat "$stderr_file" >&2
+
+  if [[ -n "$result_file" ]]; then
+    write_remote_result_json "$status" "$stdout_file" "$stderr_file" "$result_file"
+  fi
+
+  rm -f "$stdout_file" "$stderr_file"
+  return "$status"
 }
 
 remote_run() {
   local name="$1"
   local remote_cmd="$2"
   local result_file="${3:-}"
-  local timeout="${4:-$remote_timeout}"
+  local timeout_seconds="${4:-$remote_timeout}"
 
   info "$name"
   if is_true "$dry_run"; then
-    echo "DRY-RUN remote[$ssh_alias]: $remote_cmd"
+    echo "DRY-RUN remote[$ssh_user@$ssh_host:$ssh_port]: $remote_cmd"
     return
   fi
 
-  local json
-  local status=0
-  set +e
-  json="$(remote_json "$remote_cmd" "$timeout" 2>&1)"
-  status=$?
-  set -e
-  if [[ -n "$result_file" ]]; then
-    printf "%s\n" "$json" > "$result_file"
-    chmod 600 "$result_file" || true
-  fi
-
-  printf "%s" "$json" | python3 -c '
-import json, sys
-data = json.load(sys.stdin)
-stdout = data.get("stdout") or ""
-stderr = data.get("stderr") or ""
-if stdout:
-    print(stdout, end="")
-if stderr:
-    print(stderr, end="", file=sys.stderr)
-code = int(data.get("exit_code") or 0)
-if code != 0 or data.get("success") is False:
-    sys.exit(code or 1)
-' || status=$?
-
-  return "$status"
+  remote_run_capture "$remote_cmd" "$result_file" "$timeout_seconds"
 }
 
 remote_run_allow_fail() {
-  local name="$1"
-  local remote_cmd="$2"
-  local result_file="${3:-}"
-  local timeout="${4:-$remote_timeout}"
-
-  info "$name"
-  if is_true "$dry_run"; then
-    echo "DRY-RUN remote[$ssh_alias]: $remote_cmd"
-    return 0
-  fi
-
-  local json
-  set +e
-  json="$(remote_json "$remote_cmd" "$timeout" 2>&1)"
-  local status=$?
-  set -e
-
-  if [[ -n "$result_file" ]]; then
-    printf "%s\n" "$json" > "$result_file"
-    chmod 600 "$result_file" || true
-  fi
-
-  printf "%s" "$json" | python3 -c '
-import json, sys
-raw = sys.stdin.read()
-try:
-    data = json.loads(raw)
-except Exception:
-    print(raw, end="")
-    sys.exit(1)
-stdout = data.get("stdout") or ""
-stderr = data.get("stderr") or ""
-if stdout:
-    print(stdout, end="")
-if stderr:
-    print(stderr, end="", file=sys.stderr)
-code = int(data.get("exit_code") or 0)
-if code != 0 or data.get("success") is False:
-    sys.exit(code or 1)
-' || status=$?
-
-  return "$status"
+  remote_run "$@"
 }
 
 remote_stdout() {
   local remote_cmd="$1"
-  local timeout="${2:-$remote_timeout}"
-  local json
-  json="$(remote_json "$remote_cmd" "$timeout")"
-  printf "%s" "$json" | python3 -c 'import json, sys; print(json.load(sys.stdin).get("stdout") or "", end="")'
+  local timeout_seconds="${2:-$remote_timeout}"
+  local stdout_file stderr_file status
+
+  if is_true "$dry_run"; then
+    echo "DRY-RUN remote[$ssh_user@$ssh_host:$ssh_port]: $remote_cmd"
+    return
+  fi
+
+  stdout_file="$(mktemp)"
+  stderr_file="$(mktemp)"
+  set +e
+  remote_exec "$timeout_seconds" "$remote_cmd" >"$stdout_file" 2>"$stderr_file"
+  status=$?
+  set -e
+
+  if [[ "$status" -ne 0 ]]; then
+    cat "$stderr_file" >&2
+    rm -f "$stdout_file" "$stderr_file"
+    return "$status"
+  fi
+
+  cat "$stdout_file"
+  rm -f "$stdout_file" "$stderr_file"
+}
+
+deploy_public_key_to_remote() {
+  local expanded_key pubkey_file pubkey deploy_cmd
+
+  expanded_key="$(expand_path "$ssh_key_file")"
+  pubkey_file="${expanded_key}.pub"
+  [[ -f "$pubkey_file" ]] || die "public key not found: $pubkey_file"
+
+  pubkey="$(cat "$pubkey_file")"
+  deploy_cmd="set -e; umask 077; mkdir -p ~/.ssh; touch ~/.ssh/authorized_keys; grep -qxF $(shell_quote "$pubkey") ~/.ssh/authorized_keys || printf '%s\n' $(shell_quote "$pubkey") >> ~/.ssh/authorized_keys; chmod 700 ~/.ssh; chmod 600 ~/.ssh/authorized_keys"
+  remote_run "Deploying local public key" "$deploy_cmd" "$backup_dir/ssh-deploy-pubkey.json" "$remote_timeout"
+}
+
+bootstrap_remote_ssh() {
+  local probe_cmd
+  probe_cmd='set -e; echo "whoami=$(whoami)"; echo "hostname=$(hostname)"; echo "ssh_connection=$SSH_CONNECTION"; echo "local_ips=$(hostname -I 2>/dev/null || true)"; echo "public_v4=$(curl -4 -fsS --max-time 8 https://api.ipify.org || true)"; echo "machine_id=$(cat /etc/machine-id 2>/dev/null || true)"'
+
+  ensure_local_ssh_tools
+  if [[ "$migrate_key_auth" == "true" && -n "$ssh_password" ]]; then
+    ensure_local_ssh_key
+  fi
+
+  if [[ -n "$ssh_password" ]]; then
+    remote_auth_mode="password"
+  else
+    remote_auth_mode="key"
+  fi
+
+  remote_run "Verifying SSH connection" "$probe_cmd" "$backup_dir/ssh-probe.json" "$remote_timeout"
+
+  if [[ "$migrate_key_auth" == "false" ]]; then
+    return
+  fi
+
+  if [[ -n "$ssh_password" ]]; then
+    deploy_public_key_to_remote
+    remote_auth_mode="key"
+    remote_run "Verifying key-auth SSH" "$probe_cmd" "$backup_dir/ssh-key-probe.json" "$remote_timeout"
+  fi
 }
 
 check_remote_port() {

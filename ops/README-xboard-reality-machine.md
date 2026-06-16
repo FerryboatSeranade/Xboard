@@ -5,13 +5,13 @@
 它适合当前这种机器形态：
 
 - 本地 Xboard 面板跑在 Docker 容器 `xboard-web-1`。
-- 远端服务器可以是已配置好的 `ssh-skill` alias，也可以只给 IP、用户名和密码。
+- 远端服务器只需要能 SSH 登录；可以给 IP、用户名和密码，也可以给本机 OpenSSH alias。
 - VLESS Reality 默认监听 `443`。
 - 如果远端 `443` 被旧服务占用，可以显式传入停服命令。
 - 写入面板前会自动备份 SQLite 数据库。
 - 如果远端开启了 UFW/firewalld，默认会自动放行 `443/tcp`。
 
-所有远端命令都会通过 `ssh-skill` 执行，不直接调用裸 `ssh`。
+脚本使用本机 `ssh`/`sshpass` 执行远端命令，不依赖 `ssh-skill`、Codex 或任何额外账号体系。给密码时如果本机缺少 `sshpass`，脚本会尽量自动安装；首次连通后会把本机公钥写入远端，后续可以免密复跑。
 
 如果脚本没有执行权限，可以先运行：
 
@@ -25,7 +25,6 @@ chmod +x /root/data/docker_data/Xboard/ops/xboard-reality-machine.sh
 
 ```bash
 /root/data/docker_data/Xboard/ops/xboard-reality-machine.sh \
-  --ssh-alias vultr-002 \
   --ssh-host 1.2.3.4 \
   --ssh-user root \
   --ssh-password '服务器密码' \
@@ -39,20 +38,19 @@ chmod +x /root/data/docker_data/Xboard/ops/xboard-reality-machine.sh
 
 给服务器连接信息后，脚本会自动完成：
 
-1. 创建或更新 `ssh-skill` alias。
-2. 用密码首次连接远端。
-3. 部署本机公钥，并把 alias 迁移成密钥免密。
+1. 用密码或本机 SSH 密钥连接远端。
+2. 必要时自动安装本机 `sshpass`。
+3. 部署本机公钥，后续复跑可以免密。
 4. 创建或复用 Xboard machine。
 5. 创建或更新 VLESS Reality 节点。
 6. 安装或更新 `xboard-node`。
 7. 自动放行远端防火墙 `443/tcp`。
 8. 检查公网 `443`、远端健康检查和面板在线状态。
 
-新机器首次安装需要下载 `xboard-node` 和 `xbctl`，脚本默认给安装阶段 `900` 秒超时，避免被 `ssh-skill` 默认的短超时提前中断。
+新机器首次安装需要下载 `xboard-node` 和 `xbctl`，脚本默认给安装阶段 `900` 秒超时。
 
 ```bash
 /root/data/docker_data/Xboard/ops/xboard-reality-machine.sh \
-  --ssh-alias vultr-002 \
   --ssh-host 1.2.3.4 \
   --ssh-user root \
   --ssh-password '服务器密码' \
@@ -63,13 +61,13 @@ chmod +x /root/data/docker_data/Xboard/ops/xboard-reality-machine.sh
 
 这里如果不单独传 `--host`，节点对外地址会默认使用 `--ssh-host`。
 
-## 使用已有 ssh-skill alias 部署
+## 使用已有 OpenSSH alias 部署
 
-如果远端 alias 已经存在，可以只给 alias 和节点信息：
+如果 `~/.ssh/config` 里已经有可用的 OpenSSH Host alias，可以直接把它传给 `--ssh-host`：
 
 ```bash
 /root/data/docker_data/Xboard/ops/xboard-reality-machine.sh \
-  --ssh-alias dmit \
+  --ssh-host dmit \
   --machine-name dmit \
   --node-name "dmit us" \
   --host 69.63.203.46 \
@@ -84,7 +82,7 @@ chmod +x /root/data/docker_data/Xboard/ops/xboard-reality-machine.sh
 
 ```bash
 /root/data/docker_data/Xboard/ops/xboard-reality-machine.sh \
-  --ssh-alias dmit \
+  --ssh-host dmit \
   --machine-name dmit \
   --node-name "dmit us" \
   --host 69.63.203.46 \
@@ -98,7 +96,7 @@ chmod +x /root/data/docker_data/Xboard/ops/xboard-reality-machine.sh
 
 ```bash
 /root/data/docker_data/Xboard/ops/xboard-reality-machine.sh \
-  --ssh-alias dmit \
+  --ssh-host dmit \
   --machine-name dmit \
   --node-name "dmit us" \
   --host 69.63.203.46 \
@@ -108,7 +106,8 @@ chmod +x /root/data/docker_data/Xboard/ops/xboard-reality-machine.sh
 
 ## 常用开关
 
-- `--no-setup-ssh`：不自动创建或更新 `ssh-skill` alias。
+- `--ssh-alias ALIAS`：可选本地标签；不参与 SSH 连接，主要用于默认 machine/node 名称。
+- `--no-install-local-deps`：不自动安装本机依赖，例如 `sshpass`。
 - `--no-migrate-key-auth`：不自动部署公钥，也不迁移密钥免密。
 - `--no-open-firewall`：不自动放行远端防火墙。
 - `--no-public-port-check`：不检查公网端口是否可连。
@@ -129,8 +128,8 @@ chmod +x /root/data/docker_data/Xboard/ops/xboard-reality-machine.sh
 - `database.sqlite.before`
 - `database.sqlite.after`
 - `ssh-probe.json`
-- `ssh-deploy-pubkey.log`
-- `ssh-migrate-key-auth.log`
+- `ssh-deploy-pubkey.json`
+- `ssh-key-probe.json`
 - `panel-result.env`，包含 machine token 和 Reality 公开元信息
 - `remote-before.txt`
 - `remote-install.json` 或 `remote-restart.json`
