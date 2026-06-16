@@ -44,6 +44,7 @@ skip_install="false"
 rotate_reality_keys="false"
 migrate_key_auth="true"
 auto_install_local_deps="true"
+auto_fix_known_hosts="true"
 open_firewall="true"
 verify_public_port="true"
 assume_yes="false"
@@ -95,6 +96,7 @@ usage() {
   --skip-install               不运行安装器，只重启/验证已有 xboard-node
   --rotate-reality-keys        更新已有节点时也轮换 Reality key
   --no-install-local-deps       不自动安装本机 sshpass 等依赖
+  --no-fix-known-hosts         不自动清理本机 known_hosts 里的旧主机指纹
   --no-migrate-key-auth        不自动部署公钥/迁移密钥认证
   --no-open-firewall           不自动放行远端防火墙 443/tcp
   --no-public-port-check       不从本机检查节点公网端口
@@ -220,6 +222,7 @@ parse_args() {
       --rotate-reality-keys) rotate_reality_keys="true"; shift ;;
       --no-install-local-deps) auto_install_local_deps="false"; shift ;;
       --no-setup-ssh) auto_install_local_deps="false"; shift ;;
+      --no-fix-known-hosts) auto_fix_known_hosts="false"; shift ;;
       --no-migrate-key-auth) migrate_key_auth="false"; shift ;;
       --no-open-firewall) open_firewall="false"; shift ;;
       --no-public-port-check) verify_public_port="false"; shift ;;
@@ -319,6 +322,7 @@ Plan
   Skip install:      $skip_install
   Rotate keys:       $rotate_reality_keys
   Install deps:      $auto_install_local_deps
+  Fix known_hosts:   $auto_fix_known_hosts
   Migrate key auth:  $migrate_key_auth
   Open firewall:     $open_firewall
   Public port check: $verify_public_port
@@ -655,6 +659,25 @@ remote_exec() {
   fi
 }
 
+is_known_hosts_mismatch() {
+  local stderr_file="$1"
+  grep -Eq 'REMOTE HOST IDENTIFICATION HAS CHANGED|Host key verification failed|Offending .* key in .*known_hosts' "$stderr_file"
+}
+
+fix_known_hosts_for_remote() {
+  local known_host="$ssh_host"
+
+  [[ "$auto_fix_known_hosts" == "true" ]] || return 1
+  [[ -n "$known_host" ]] || return 1
+  command -v ssh-keygen >/dev/null || return 1
+
+  info "Removing stale known_hosts entry for $known_host"
+  ssh-keygen -R "$known_host" >/dev/null 2>&1 || true
+  if [[ "$ssh_port" != "22" ]]; then
+    ssh-keygen -R "[$known_host]:$ssh_port" >/dev/null 2>&1 || true
+  fi
+}
+
 write_remote_result_json() {
   local exit_code="$1"
   local stdout_file="$2"
@@ -690,6 +713,12 @@ remote_run_capture() {
   set +e
   remote_exec "$timeout_seconds" "$remote_cmd" >"$stdout_file" 2>"$stderr_file"
   status=$?
+  if [[ "$status" -ne 0 ]] && is_known_hosts_mismatch "$stderr_file" && fix_known_hosts_for_remote; then
+    : >"$stdout_file"
+    : >"$stderr_file"
+    remote_exec "$timeout_seconds" "$remote_cmd" >"$stdout_file" 2>"$stderr_file"
+    status=$?
+  fi
   set -e
 
   cat "$stdout_file"
@@ -737,6 +766,12 @@ remote_stdout() {
   set +e
   remote_exec "$timeout_seconds" "$remote_cmd" >"$stdout_file" 2>"$stderr_file"
   status=$?
+  if [[ "$status" -ne 0 ]] && is_known_hosts_mismatch "$stderr_file" && fix_known_hosts_for_remote; then
+    : >"$stdout_file"
+    : >"$stderr_file"
+    remote_exec "$timeout_seconds" "$remote_cmd" >"$stdout_file" 2>"$stderr_file"
+    status=$?
+  fi
   set -e
 
   if [[ "$status" -ne 0 ]]; then
