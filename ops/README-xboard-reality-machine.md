@@ -48,6 +48,8 @@ chmod +x /root/data/docker_data/Xboard/ops/xboard-reality-machine.sh
 7. 自动放行远端防火墙 `443/tcp`。
 8. 检查公网 `443`、远端健康检查和面板在线状态。
 
+新机器首次安装需要下载 `xboard-node` 和 `xbctl`，脚本默认给安装阶段 `900` 秒超时，避免被 `ssh-skill` 默认的短超时提前中断。
+
 ```bash
 /root/data/docker_data/Xboard/ops/xboard-reality-machine.sh \
   --ssh-alias vultr-002 \
@@ -111,6 +113,8 @@ chmod +x /root/data/docker_data/Xboard/ops/xboard-reality-machine.sh
 - `--no-open-firewall`：不自动放行远端防火墙。
 - `--no-public-port-check`：不检查公网端口是否可连。
 - `--remote-stop-command`：目标端口被旧服务占用时，先执行这条远端命令释放端口。
+- `--remote-timeout SEC`：普通远端命令超时秒数，默认 `90`。
+- `--install-timeout SEC`：安装或更新 `xboard-node` 的超时秒数，默认 `900`。
 
 ## 备份位置
 

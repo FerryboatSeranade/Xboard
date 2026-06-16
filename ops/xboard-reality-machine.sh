@@ -7,6 +7,8 @@ DEFAULT_PANEL_URL=""
 DEFAULT_GROUPS="1"
 DEFAULT_PORT="443"
 DEFAULT_HEALTH_PORT="65530"
+DEFAULT_REMOTE_TIMEOUT="90"
+DEFAULT_INSTALL_TIMEOUT="900"
 DEFAULT_REALITY_SNI="addons.mozilla.org"
 DEFAULT_REALITY_DEST_PORT="443"
 DEFAULT_FINGERPRINT="chrome"
@@ -24,6 +26,8 @@ panel_url="$DEFAULT_PANEL_URL"
 groups="$DEFAULT_GROUPS"
 port="$DEFAULT_PORT"
 health_port="$DEFAULT_HEALTH_PORT"
+remote_timeout="$DEFAULT_REMOTE_TIMEOUT"
+install_timeout="$DEFAULT_INSTALL_TIMEOUT"
 reality_sni="$DEFAULT_REALITY_SNI"
 reality_dest_port="$DEFAULT_REALITY_DEST_PORT"
 fingerprint="$DEFAULT_FINGERPRINT"
@@ -80,6 +84,8 @@ usage() {
   --groups CSV                 用户组 ID，逗号分隔。默认: 1
   --port PORT                  客户端连接端口/服务监听端口。默认: 443
   --health-port PORT           xboard-node 健康检查端口。默认: 65530
+  --remote-timeout SEC         普通远端命令超时秒数。默认: 90
+  --install-timeout SEC        xboard-node 安装/更新超时秒数。默认: 900
   --reality-sni HOST           Reality 伪装目标 SNI。默认: addons.mozilla.org
   --reality-dest-port PORT     Reality 伪装目标端口。默认: 443
   --fingerprint NAME           uTLS 指纹。默认: chrome
@@ -204,6 +210,8 @@ parse_args() {
       --groups) groups="${2:?}"; shift 2 ;;
       --port) port="${2:?}"; shift 2 ;;
       --health-port) health_port="${2:?}"; shift 2 ;;
+      --remote-timeout) remote_timeout="${2:?}"; shift 2 ;;
+      --install-timeout) install_timeout="${2:?}"; shift 2 ;;
       --reality-sni) reality_sni="${2:?}"; shift 2 ;;
       --reality-dest-port) reality_dest_port="${2:?}"; shift 2 ;;
       --fingerprint) fingerprint="${2:?}"; shift 2 ;;
@@ -288,6 +296,8 @@ collect_inputs() {
   [[ -n "$node_name" ]] || die "--node-name is required"
   [[ "$port" =~ ^[0-9]+$ ]] || die "--port must be numeric"
   [[ "$health_port" =~ ^[0-9]+$ ]] || die "--health-port must be numeric"
+  [[ "$remote_timeout" =~ ^[0-9]+$ ]] || die "--remote-timeout must be numeric"
+  [[ "$install_timeout" =~ ^[0-9]+$ ]] || die "--install-timeout must be numeric"
   [[ "$reality_dest_port" =~ ^[0-9]+$ ]] || die "--reality-dest-port must be numeric"
 }
 
@@ -306,6 +316,8 @@ Plan
   Groups:            $groups
   Listen port:       $port
   Health port:       $health_port
+  Remote timeout:    ${remote_timeout}s
+  Install timeout:   ${install_timeout}s
   Reality dest:      $reality_sni:$reality_dest_port
   Fingerprint/flow:  $fingerprint / $flow
   Show/enabled:      $show / $enabled
@@ -696,7 +708,7 @@ bootstrap_remote_ssh() {
   if is_true "$dry_run"; then
     echo "DRY-RUN remote[$ssh_alias]: $probe_cmd"
   else
-    remote_run "SSH probe" "$probe_cmd" "$backup_dir/ssh-probe.json"
+    remote_run "SSH probe" "$probe_cmd" "$backup_dir/ssh-probe.json" "$remote_timeout"
   fi
 
   if [[ "$migrate_key_auth" == "false" ]]; then
@@ -718,6 +730,7 @@ bootstrap_remote_ssh() {
   if python3 "$SSH_CONFIG_MANAGER" list-servers \
       | python3 -c 'import json,sys; d=json.load(sys.stdin); alias=sys.argv[1]; item=next((s for s in d.get("servers", []) if s.get("alias")==alias), {}); sys.exit(0 if item.get("auth")=="密钥" else 1)' "$ssh_alias"; then
     info "SSH alias already uses key auth"
+    clean_ssh_secret_metadata
     return
   fi
 
@@ -725,18 +738,20 @@ bootstrap_remote_ssh() {
   python3 "$SSH_DEPLOY_PUBKEY" "$ssh_alias" --pubkey-file "$pubkey_file" --key-name "$key_name" | tee "$backup_dir/ssh-deploy-pubkey.log"
   python3 "$SSH_MIGRATE_KEY_AUTH" "$ssh_alias" --key-file "$key_name" | tee "$backup_dir/ssh-migrate-key-auth.log"
   clean_ssh_secret_metadata
-  remote_run "Verifying key-auth SSH" "$probe_cmd" "$backup_dir/ssh-key-probe.json"
+  remote_run "Verifying key-auth SSH" "$probe_cmd" "$backup_dir/ssh-key-probe.json" "$remote_timeout"
 }
 
 remote_json() {
   local remote_cmd="$1"
-  python3 "$SSH_EXECUTE" "$ssh_alias" "$remote_cmd"
+  local timeout="${2:-$remote_timeout}"
+  python3 "$SSH_EXECUTE" "$ssh_alias" "$remote_cmd" --timeout "$timeout"
 }
 
 remote_run() {
   local name="$1"
   local remote_cmd="$2"
   local result_file="${3:-}"
+  local timeout="${4:-$remote_timeout}"
 
   info "$name"
   if is_true "$dry_run"; then
@@ -745,7 +760,11 @@ remote_run() {
   fi
 
   local json
-  json="$(remote_json "$remote_cmd")"
+  local status=0
+  set +e
+  json="$(remote_json "$remote_cmd" "$timeout" 2>&1)"
+  status=$?
+  set -e
   if [[ -n "$result_file" ]]; then
     printf "%s\n" "$json" > "$result_file"
     chmod 600 "$result_file" || true
@@ -763,13 +782,16 @@ if stderr:
 code = int(data.get("exit_code") or 0)
 if code != 0 or data.get("success") is False:
     sys.exit(code or 1)
-'
+' || status=$?
+
+  return "$status"
 }
 
 remote_run_allow_fail() {
   local name="$1"
   local remote_cmd="$2"
   local result_file="${3:-}"
+  local timeout="${4:-$remote_timeout}"
 
   info "$name"
   if is_true "$dry_run"; then
@@ -779,7 +801,7 @@ remote_run_allow_fail() {
 
   local json
   set +e
-  json="$(remote_json "$remote_cmd" 2>&1)"
+  json="$(remote_json "$remote_cmd" "$timeout" 2>&1)"
   local status=$?
   set -e
 
@@ -812,8 +834,9 @@ if code != 0 or data.get("success") is False:
 
 remote_stdout() {
   local remote_cmd="$1"
+  local timeout="${2:-$remote_timeout}"
   local json
-  json="$(remote_json "$remote_cmd")"
+  json="$(remote_json "$remote_cmd" "$timeout")"
   printf "%s" "$json" | python3 -c 'import json, sys; print(json.load(sys.stdin).get("stdout") or "", end="")'
 }
 
@@ -822,13 +845,13 @@ check_remote_port() {
   check_cmd="printf 'listeners:\n'; ss -lntup | grep -E ':(${port}|${health_port})\\b' || true; printf '\ncontainers:\n'; docker ps --format '{{.Names}} {{.Status}} {{.Ports}}' || true"
 
   if is_true "$dry_run"; then
-    remote_run "Checking remote ports" "$check_cmd"
+    remote_run "Checking remote ports" "$check_cmd" "" "$remote_timeout"
     return
   fi
 
   info "Checking remote ports"
   local out
-  out="$(remote_stdout "$check_cmd")"
+  out="$(remote_stdout "$check_cmd" "$remote_timeout")"
   printf "%s" "$out" | tee "$backup_dir/remote-before.txt"
 
   if printf "%s" "$out" | grep -Eq ":${port}[[:space:]]"; then
@@ -844,7 +867,7 @@ check_remote_port() {
       read -r -p "Remote stop command: " remote_stop_command
     fi
     [[ -n "$remote_stop_command" ]] || die "port $port is occupied and no --remote-stop-command was provided"
-    remote_run "Freeing remote port $port" "$remote_stop_command" "$backup_dir/remote-stop.json"
+    remote_run "Freeing remote port $port" "$remote_stop_command" "$backup_dir/remote-stop.json" "$remote_timeout"
   fi
 }
 
@@ -858,12 +881,12 @@ install_or_restart_remote_node() {
     remote_run_allow_fail "Restarting existing xboard-node" "$restart_cmd" "$backup_dir/remote-restart.json" \
       || die "failed to restart xboard-node; see $backup_dir/remote-restart.json"
   else
-    remote_run_allow_fail "Installing/updating xboard-node" "$install_cmd" "$backup_dir/remote-install.json" \
+    remote_run_allow_fail "Installing/updating xboard-node" "$install_cmd" "$backup_dir/remote-install.json" "$install_timeout" \
       || die "failed to install xboard-node; see $backup_dir/remote-install.json"
   fi
 
   verify_cmd="sleep 4; printf 'service:\n'; systemctl is-active xboard-node || true; systemctl --no-pager --full status xboard-node | sed -n '1,24p' || true; printf '\nlisteners:\n'; ss -lntup | grep -E ':(${port}|${health_port})\\b' || true; printf '\nhealth:\n'; curl -fsS http://127.0.0.1:${health_port}/healthz || true; printf '\nrecent logs:\n'; journalctl -u xboard-node -n 80 --no-pager || true"
-  remote_run "Verifying remote xboard-node" "$verify_cmd" "$backup_dir/remote-after.json"
+  remote_run "Verifying remote xboard-node" "$verify_cmd" "$backup_dir/remote-after.json" "$remote_timeout"
 }
 
 open_remote_firewall() {
