@@ -11,6 +11,7 @@
 - 写入面板前会自动备份 SQLite 数据库。
 - 如果远端开启了 UFW/firewalld，默认会自动放行 `443/tcp`。
 - 如果同一个 IP 重装过系统导致本机 `known_hosts` 旧指纹冲突，默认会自动清理旧记录并重试一次。
+- 如果远端已有其他 machine 的 `xboard-node` 配置，默认会先备份并清理旧配置，再安装本次 machine。
 
 脚本使用本机 `ssh`/`sshpass` 执行远端命令，不依赖 `ssh-skill`、Codex 或任何额外账号体系。给密码时如果本机缺少 `sshpass`，脚本会尽量自动安装；首次连通后会把本机公钥写入远端，后续可以免密复跑。
 
@@ -110,6 +111,7 @@ chmod +x /root/data/docker_data/Xboard/ops/xboard-reality-machine.sh
 - `--ssh-alias ALIAS`：可选本地标签；不参与 SSH 连接，主要用于默认 machine/node 名称。
 - `--no-install-local-deps`：不自动安装本机依赖，例如 `sshpass`。
 - `--no-fix-known-hosts`：不自动清理本机 `known_hosts` 里的旧主机指纹。
+- `--no-clean-stale-config`：不自动清理远端旧 `xboard-node` machine 配置。
 - `--no-migrate-key-auth`：不自动部署公钥，也不迁移密钥免密。
 - `--no-open-firewall`：不自动放行远端防火墙。
 - `--no-public-port-check`：不检查公网端口是否可连。
@@ -134,6 +136,7 @@ chmod +x /root/data/docker_data/Xboard/ops/xboard-reality-machine.sh
 - `ssh-key-probe.json`
 - `panel-result.env`，包含 machine token 和 Reality 公开元信息
 - `remote-before.txt`
+- `remote-prepare.json`
 - `remote-install.json` 或 `remote-restart.json`
 - `remote-firewall.json`
 - `remote-after.json`

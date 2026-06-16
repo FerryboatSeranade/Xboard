@@ -45,6 +45,7 @@ rotate_reality_keys="false"
 migrate_key_auth="true"
 auto_install_local_deps="true"
 auto_fix_known_hosts="true"
+clean_stale_remote_config="true"
 open_firewall="true"
 verify_public_port="true"
 assume_yes="false"
@@ -97,6 +98,7 @@ usage() {
   --rotate-reality-keys        更新已有节点时也轮换 Reality key
   --no-install-local-deps       不自动安装本机 sshpass 等依赖
   --no-fix-known-hosts         不自动清理本机 known_hosts 里的旧主机指纹
+  --no-clean-stale-config      不自动清理远端旧 xboard-node machine 配置
   --no-migrate-key-auth        不自动部署公钥/迁移密钥认证
   --no-open-firewall           不自动放行远端防火墙 443/tcp
   --no-public-port-check       不从本机检查节点公网端口
@@ -223,6 +225,7 @@ parse_args() {
       --no-install-local-deps) auto_install_local_deps="false"; shift ;;
       --no-setup-ssh) auto_install_local_deps="false"; shift ;;
       --no-fix-known-hosts) auto_fix_known_hosts="false"; shift ;;
+      --no-clean-stale-config) clean_stale_remote_config="false"; shift ;;
       --no-migrate-key-auth) migrate_key_auth="false"; shift ;;
       --no-open-firewall) open_firewall="false"; shift ;;
       --no-public-port-check) verify_public_port="false"; shift ;;
@@ -323,6 +326,7 @@ Plan
   Rotate keys:       $rotate_reality_keys
   Install deps:      $auto_install_local_deps
   Fix known_hosts:   $auto_fix_known_hosts
+  Clean stale config: $clean_stale_remote_config
   Migrate key auth:  $migrate_key_auth
   Open firewall:     $open_firewall
   Public port check: $verify_public_port
@@ -855,6 +859,41 @@ check_remote_port() {
   fi
 }
 
+prepare_remote_node_config() {
+  [[ "$clean_stale_remote_config" == "true" ]] || return
+  [[ "$skip_install" == "false" ]] || return
+
+  local installer_url prepare_cmd
+  installer_url="https://raw.githubusercontent.com/cedar2025/xboard-node/dev/install.sh"
+  prepare_cmd="$(cat <<EOF
+set -e
+current_machine_id=""
+if [ -f /etc/xboard-node/config.yml ]; then
+  current_machine_id=\$(awk '
+    /^[[:space:]]*machine_id:[[:space:]]*/ {
+      gsub(/[^0-9]/, "", \$2);
+      print \$2;
+      exit
+    }
+  ' /etc/xboard-node/config.yml)
+fi
+if [ -n "\$current_machine_id" ] && [ "\$current_machine_id" != "$machine_id" ]; then
+  mkdir -p /root/xboard-node-backups
+  backup=/root/xboard-node-backups/xboard-node-\$(date -u +%Y%m%dT%H%M%SZ).tgz
+  tar -C /etc -czf "\$backup" xboard-node 2>/dev/null || true
+  echo "stale_machine_id=\$current_machine_id"
+  echo "backup=\$backup"
+  curl -fsSL $(shell_quote "$installer_url") | bash -s -- uninstall --purge --yes
+else
+  echo "stale_machine_id=\${current_machine_id:-none}"
+fi
+EOF
+)"
+
+  remote_run_allow_fail "Preparing remote xboard-node config" "$prepare_cmd" "$backup_dir/remote-prepare.json" "$remote_timeout" \
+    || die "failed to prepare remote xboard-node config; see $backup_dir/remote-prepare.json"
+}
+
 install_or_restart_remote_node() {
   local installer_url install_cmd restart_cmd verify_cmd
   installer_url="https://raw.githubusercontent.com/cedar2025/xboard-node/dev/install.sh"
@@ -951,6 +990,7 @@ main() {
   panel_upsert
   backup_database_after
   check_remote_port
+  prepare_remote_node_config
   install_or_restart_remote_node
   open_remote_firewall
   verify_public_node_port
